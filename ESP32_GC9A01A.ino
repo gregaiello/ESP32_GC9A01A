@@ -1,22 +1,23 @@
 #include "SPI.h"
 #include "Adafruit_GFX.h"
 #include "Adafruit_GC9A01A.h"
+#include <NimBLEDevice.h>
 
-
-// Other RP2040-based boards might not have "D" pin defines as shown above
-// and will use GPIO bit numbers. On non-RP2040 boards, you can usually use
-// pin numbers silkscreened on the board.
 #define TFT_DC  2
 #define TFT_MOSI  7
 #define TFT_CS 10
 #define TFT_CLK 6
-// If display breakout has a backlight control pin, that can be defined here
-// as TFT_BL. On some breakouts it's not needed, backlight is always on.
 #define TFT_BL 3
+
+NimBLEUUID serviceUUID("180D");  // Heart Rate Service
+NimBLEUUID charUUID("2A37");     // Heart Rate Measurement Characteristic
+
+NimBLEAdvertisedDevice* myDevice;
 
 int x; 
 int y; 
 int r;
+int hr;
 
 typedef struct {
     const char *name;
@@ -48,32 +49,159 @@ Color colors[] = {
 
 #define NUM_COLORS (sizeof(colors) / sizeof(colors[0]))
 
-// Display constructor for primary hardware SPI connection -- the specific
-// pins used for writing to the display are unique to each board and are not
-// negotiable. "Soft" SPI (using any pins) is an option but performance is
-// reduced; it's rarely used, see header file for syntax if needed.
 Adafruit_GC9A01A tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_CLK);
+
+bool doConnect = false;
+bool connected = false;
+bool doScan = false;
+NimBLEClient* pClient = nullptr;
+
+// Callback to handle notifications from the HRM
+class MyClientCallback : public NimBLEClientCallbacks {
+    void onConnect(NimBLEClient* pClient) {
+        Serial.println("Connected to HRM");
+        tft.fillScreen(GC9A01A_BLACK);
+        tft.setCursor(50, 50);
+        tft.setTextColor(GC9A01A_WHITE);  tft.setTextSize(1);
+        tft.setTextSize(1);
+        tft.println("HRM Connected");
+    }
+
+    void onDisconnect(NimBLEClient* pClient) {
+        Serial.println("Disconnected from HRM");
+        tft.fillScreen(GC9A01A_BLACK);
+        tft.setCursor(50, 50);
+        tft.setTextColor(GC9A01A_WHITE);  tft.setTextSize(1);
+        tft.setTextSize(1);
+        tft.println("HRM Disonnected");
+        connected = false;
+        doScan = true;
+    }
+};
+
+// Callback to handle found devices during scanning
+class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
+    void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
+        Serial.print("Device found: ");
+        Serial.println(advertisedDevice->toString().c_str());
+
+        // Check if the device is a heart rate monitor
+        if (advertisedDevice->haveServiceUUID() && advertisedDevice->isAdvertisingService(serviceUUID)) {
+            Serial.println("Heart Rate Monitor found, stopping scan...");
+            NimBLEDevice::getScan()->stop();
+            myDevice = advertisedDevice;
+            doConnect = true;
+        }
+    }
+};
+
+// Function to connect to the server (HRM)
+bool connectToServer() {
+    pClient = NimBLEDevice::createClient();
+    pClient->setClientCallbacks(new MyClientCallback());
+
+    // Connect to the HRM
+    if (!pClient->connect(myDevice)) {
+        Serial.println("Failed to connect.");
+        return false;
+    }
+
+    // Once connected, we search for the Heart Rate service
+    NimBLERemoteService* pService = pClient->getService(serviceUUID);  // Use NimBLERemoteService here
+    if (pService == nullptr) {
+        Serial.println("Heart Rate service not found.");
+        pClient->disconnect();
+        return false;
+    }
+
+    NimBLERemoteCharacteristic* pCharacteristic = pService->getCharacteristic(charUUID);
+    if (pCharacteristic == nullptr) {
+        Serial.println("Heart Rate characteristic not found.");
+        pClient->disconnect();
+        return false;
+    }
+
+    connected = true;
+    return true;
+}
+
+// Callback function to handle notifications from the HRM
+void onNotifyHRM(NimBLERemoteCharacteristic* pCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
+    if (length > 0) {
+        // The first byte contains the flags, and the heart rate data follows
+        tft.setCursor(110, 110);
+        tft.setTextColor(GC9A01A_BLACK);  tft.setTextSize(5);
+        tft.setTextSize(5);
+        tft.println(hr);
+        hr = pData[1];  // Heart rate is usually in the second byte
+        tft.setCursor(110, 110);
+        tft.setTextColor(GC9A01A_WHITE);  tft.setTextSize(5);
+        tft.setTextSize(5);
+        tft.println(hr);
+    }
+}
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("GC9A01A Test!");
+
+  Serial.println("Start LCD Init ..");
 
   tft.begin();
-
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH); // Backlight on
+  tft.fillScreen(GC9A01A_BLACK);
+
+  Serial.println("Start BLE Init ..");
+
+  // Initialize BLE
+  NimBLEDevice::init("");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9); 
+  // Start scanning for devices
+  NimBLEScan* pScan = NimBLEDevice::getScan();
+  pScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks());
+  pScan->setInterval(45);
+  pScan->setWindow(15);
+  pScan->setActiveScan(true);
+  pScan->start(5, false);  // Scan for 5 seconds
 }
 
 void loop(void) {
+  // If we need to connect
+  if (doConnect) {
+    if (connectToServer()) {
+      tft.fillScreen(GC9A01A_BLACK);
+      Serial.println("Connected to HRM and ready to read data.");
+      tft.setCursor(50, 50);
+      tft.setTextColor(GC9A01A_WHITE);  tft.setTextSize(1);
+      tft.setTextSize(1);
+      tft.println("HRM Connected");
+      delay(500);
+    } else {
+      tft.fillScreen(GC9A01A_BLACK);
+      Serial.println("Failed to connect to the HRM.");
+      tft.setCursor(50, 50);
+      tft.setTextColor(GC9A01A_WHITE);  tft.setTextSize(1);
+      tft.setTextSize(1);
+      tft.println("HRM Not Connected");
+      delay(500);
+    }
+    doConnect = false;
+  }
 
-  tft.drawCircle(x, y, r, GC9A01A_BLACK); // Clean up
+  // If we are connected, we can read data
+  if (connected) {
+    NimBLERemoteCharacteristic* pRemoteCharacteristic = pClient->getService(serviceUUID)->getCharacteristic(charUUID);
+      if (pRemoteCharacteristic->canNotify()) {
+        pRemoteCharacteristic->subscribe(true, onNotifyHRM);
+      }
+  }
 
-  x = random(0,240);
-  y = random(0,240);
-  r = random(0,100);
+  if (doScan) {
+    NimBLEDevice::getScan()->start(0, false);  // Start scan forever
+    doScan = false;
+  }
 
-  tft.drawCircle(x, y, r, colors[random(1,NUM_COLORS)].value); // Skipping black
-  delay(250);
+  delay(500);
 }
 
 unsigned long testFillScreen() {
